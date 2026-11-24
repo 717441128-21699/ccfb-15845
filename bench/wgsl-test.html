@@ -1,0 +1,119 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>WGSL headless</title></head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+try {
+  if (!navigator.gpu) throw new Error('no navigator.gpu');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('no adapter');
+  const adapterInfo = adapter.info ? { vendor: adapter.info.vendor, architecture: adapter.info.architecture, deviceType: adapter.info.deviceType } : null;
+  const device = await adapter.requestDevice();
+  const wgsl = await (await fetch('/src/gpu/trace.wgsl')).text();
+
+  const ALT = 360, AZ = 1440;
+  const cells = ALT * AZ;
+  const module = device.createShaderModule({ code: wgsl });
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter((m) => m.type === 'error');
+  if (errors.length) throw new Error('shader compile: ' + errors.map((e) => e.message).join('; '));
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+
+  function makeBindGroup(uni, bufs) {
+    const ub = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(ub, 0, uni);
+    const bg = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: ub } },
+        { binding: 1, resource: { buffer: bufs[0] } },
+        { binding: 2, resource: { buffer: bufs[1] } },
+        { binding: 3, resource: { buffer: bufs[2] } },
+      ],
+    });
+    return { bg, ub };
+  }
+  function makeBufs() {
+    return [0, 1, 2].map(() => device.createBuffer({
+      size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    }));
+  }
+  function uniforms(sunAlt, rays, pad0) {
+    const uni = new Float32Array(32);
+    const uu = new Uint32Array(uni.buffer);
+    uni[0] = (sunAlt * Math.PI) / 180;
+    uu[1] = rays; uu[2] = 24; uu[3] = 7; uu[4] = 24; uu[5] = ALT; uu[6] = AZ;
+    uni[7] = pad0;
+    uni[8] = 1; uni[9] = 0; uni[10] = 0;            // 纯片状
+    uni[12] = 0.01; uni[13] = 0.05; uni[14] = 0.0;  // 摆动弧度
+    uni[16] = 0.15; uni[17] = 2.5; uni[18] = 1.0;   // 纵横比
+    return uni;
+  }
+
+  // ---- 1. 正常天空成像 + 性能 (200 万光线) ----
+  const RAYS = 2000000;
+  const bufs = makeBufs();
+  const { bg, ub } = makeBindGroup(uniforms(20, RAYS, 0), bufs);
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(Math.ceil(RAYS / 256)); pass.end();
+  const staging = device.createBuffer({ size: cells * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  enc.copyBufferToBuffer(bufs[0], 0, staging, 0, cells * 4);
+  const t0 = performance.now();
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const gpuMs = performance.now() - t0;
+  const r = new Uint32Array(staging.getMappedRange().slice(0));
+  let nonzero = 0, total = 0;
+  for (const v of r) { if (v > 0) nonzero++; total += v; }
+  if (nonzero === 0) throw new Error('GPU 天空输出全零');
+
+  // ---- 2. CZA 路径计数: 20° 应有 basal→prism, 40° 应为 0 ----
+  async function pathCounts(sunAlt, rays) {
+    const b = makeBufs();
+    const { bg: bgg, ub: u } = makeBindGroup(uniforms(sunAlt, rays, 2), b);
+    const e = device.createCommandEncoder();
+    const cp = e.beginComputePass();
+    cp.setPipeline(pipeline); cp.setBindGroup(0, bgg);
+    cp.dispatchWorkgroups(Math.ceil(rays / 256)); cp.end();
+    const st = device.createBuffer({ size: cells * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    e.copyBufferToBuffer(b[0], 0, st, 0, cells * 4);
+    device.queue.submit([e.finish()]);
+    await st.mapAsync(GPUMapMode.READ);
+    const mapped = new Uint32Array(st.getMappedRange());
+    const arr = [];
+    for (let k = 0; k < 9; k++) arr.push(mapped[k]);
+    b.forEach((x) => x.destroy()); u.destroy(); st.destroy();
+    return arr; // 槽 2 = basal入→prism出(CZA 无反射), 槽 8 = 追踪失败
+  }
+  const pc20 = await pathCounts(20, 1000000);
+  const pc40 = await pathCounts(40, 1000000);
+  const cza20 = pc20[2], cza40 = pc40[2], failures = (pc20[8] || 0) + (pc40[8] || 0);
+  // 少量光线在薄晶内经多次全反射、超过反弹上限被截断(物理正常), 容差 5%
+  const failureRate = failures / 2000000;
+  const czaCorrect = cza20 > 1000 && cza40 === 0 && failureRate < 0.05;
+
+  const extrap10M = gpuMs * (10_000_000 / RAYS);
+  window.__wgslResult = {
+    ok: nonzero > 0 && czaCorrect,
+    adapter: adapterInfo,
+    rays: RAYS,
+    gpuMs: +gpuMs.toFixed(1),
+    extrapolated10MMs: +extrap10M.toFixed(1),
+    withinThreeSecAt10M: extrap10M < 3000,
+    nonzeroCells: nonzero,
+    czaPathCount20deg: cza20,
+    czaPathCount40deg: cza40,
+    traceFailures: failures,
+    debugPc20: pc20,
+    debugPc40: pc40,
+    czaDisappearsAbove32deg: czaCorrect,
+  };
+} catch (err) {
+  window.__wgslResult = { ok: false, error: String((err && err.message) || err) };
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>冰晕模拟器 · Ice Halo Simulator</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">◐</span>
+          <div>
+            <h1>冰晕模拟器</h1>
+            <p>冰晶光线追踪 · 天空成像 · 照片比对</p>
+          </div>
+        </div>
+        <nav class="tabs" id="tabs">
+          <a href="#/sim" data-tab="sim">冰晕模拟</a>
+          <a href="#/params" data-tab="params">冰晶参数</a>
+          <a href="#/compare" data-tab="compare">照片比对</a>
+          <a href="#/catalog" data-tab="catalog">晕弧图鉴</a>
+        </nav>
+      </header>
+      <main id="page"></main>
+      <footer class="footer">
+        <span id="gpu-status">检测 WebGPU 中…</span>
+        <span class="sep">·</span>
+        <span>物理模型：六角冰晶 Snell 折射 / Fresnel 内反射 / 冰的色散折射率</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
